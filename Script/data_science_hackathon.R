@@ -1,256 +1,211 @@
-# Load required libraries
+#####################################################
+# 1. Setup
+#####################################################
+
+# Run once if needed:
+# install.packages(c("tidyverse", "tidytext", "randomForest", "tm", "caret"))
+
 library(tidyverse)
 library(tidytext)
-library(textdata)
-library(sentimentr)
-library(wordcloud)
-library(tm)
-library(SnowballC)
-library(caret)
 library(randomForest)
-library(ggplot2)
-library(dplyr)
-library(stringr)
+library(tm)
+library(caret)
+
+set.seed(123)
+
+#####################################################
+# 2. Load data
+#####################################################
 
 setwd("C:/Users/user/Documents/GitHub/Data_Science")
 
-# Read the dataset
-reviews_data <- read.csv("ebay_reviews.csv", stringsAsFactors = FALSE)
+reviews_raw <- read_csv("ebay_reviews.csv")
 
-# Display basic information about the dataset
-cat("Dataset Overview:\n")
-cat("Number of reviews:", nrow(reviews_data), "\n")
-cat("Number of categories:", length(unique(reviews_data$category)), "\n")
-cat("Categories:", paste(unique(reviews_data$category), collapse = ", "), "\n\n")
+glimpse(reviews_raw)
 
-# Check for missing values
-cat("Missing values:\n")
-print(colSums(is.na(reviews_data)))
-
-# Data preprocessing
-reviews_clean <- reviews_data %>%
-  # Remove rows with missing review content
-  filter(!is.na(review.content) & review.content != "") %>%
-  # Create a combined text field (title + content)
+# Create ID, combined text, and ML target (sentiment from rating)
+reviews <- reviews_raw %>%
   mutate(
-    full_text = paste(ifelse(is.na(review.title), "", review.title), 
-                      review.content, sep = ". "),
-    full_text = str_squish(full_text),
-    # Clean text: remove special characters, convert to lowercase
-    clean_text = str_to_lower(full_text),
-    clean_text = str_replace_all(clean_text, "[^a-zA-Z0-9\\s]", ""),
-    clean_text = str_squish(clean_text)
-  ) %>%
-  # Remove empty texts after cleaning
-  filter(clean_text != "" & !is.na(clean_text))
-
-# Basic sentiment analysis using sentimentr
-cat("Performing sentiment analysis...\n")
-reviews_with_sentiment <- reviews_clean %>%
-  mutate(
-    sentiment_score = sentiment_by(clean_text)$ave_sentiment,
-    # Classify based on sentiment score
-    sentiment_label = case_when(
-      sentiment_score > 0.1 ~ "positive",
-      sentiment_score < -0.1 ~ "negative",
-      TRUE ~ "neutral"
-    )
+    id   = row_number(),
+    text = paste(`review title`, `review content`, sep = ". "),
+    rating_class = case_when(
+      rating >= 4 ~ "positive",
+      rating == 3 ~ "neutral",
+      rating <= 2 ~ "negative"
+    ),
+    rating_class = factor(rating_class,
+                          levels = c("negative", "neutral", "positive"))
   )
 
-# Display sentiment distribution
-sentiment_distribution <- table(reviews_with_sentiment$sentiment_label)
-cat("\nSentiment Distribution:\n")
-print(sentiment_distribution)
-cat("\nSentiment Proportions:\n")
-print(prop.table(sentiment_distribution))
+#####################################################
+# 3. Build Document-Term Matrix (ALL reviews)
+#####################################################
 
-# Tokenization and word frequency analysis
-cat("\nPerforming tokenization and word frequency analysis...\n")
+corpus <- VCorpus(VectorSource(reviews$text))
 
-# Tokenize the text
-tokens <- reviews_with_sentiment %>%
-  unnest_tokens(word, clean_text) %>%
-  # Remove stop words
-  anti_join(stop_words, by = "word") %>%
-  # Remove numbers and very short words
-  filter(!str_detect(word, "^[0-9]+$"),
-         nchar(word) > 2)
+# Pre-process text
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeNumbers)
+corpus <- tm_map(corpus, removeWords, stopwords("english"))
+corpus <- tm_map(corpus, stripWhitespace)
 
-# Overall word frequency
-overall_word_freq <- tokens %>%
-  count(word, sort = TRUE) %>%
-  top_n(30, n)
+# Create DTM and remove very sparse terms
+dtm <- DocumentTermMatrix(corpus)
+dtm <- removeSparseTerms(dtm, 0.995)  # tweak if needed
 
-# Word frequency by sentiment
-sentiment_word_freq <- tokens %>%
-  count(sentiment_label, word, sort = TRUE) %>%
-  group_by(sentiment_label) %>%
-  top_n(15, n) %>%
+# Convert to data frame
+dtm_df <- as.data.frame(as.matrix(dtm))
+
+# ⬇️ FIX: add id and rating_class using base R (no mutate)
+dtm_df$id           <- reviews$id
+dtm_df$rating_class <- reviews$rating_class
+
+#####################################################
+# 4. Prepare data for Random Forest (balanced sample)
+#####################################################
+
+ml_df <- dtm_df %>%
+  filter(!is.na(rating_class))
+
+# Balance: up to 300 docs per class
+ml_bal <- ml_df %>%
+  group_by(rating_class) %>%
+  group_modify(~ {
+    size <- min(300, nrow(.x))
+    dplyr::slice_sample(.x, n = size)
+  }) %>%
   ungroup()
 
-# VISUALIZATIONS
+# Train/Test split
+train_idx  <- createDataPartition(ml_bal$rating_class, p = 0.8, list = FALSE)
+train_data <- ml_bal[train_idx, ]
+test_data  <- ml_bal[-train_idx, ]
 
-# 1. Sentiment distribution pie chart
-ggplot(reviews_with_sentiment, aes(x = "", fill = sentiment_label)) +
-  geom_bar(width = 1) +
-  coord_polar("y") +
-  labs(title = "Sentiment Distribution of E-commerce Reviews",
-       fill = "Sentiment") +
+train_x <- train_data %>% select(-id, -rating_class)
+train_y <- train_data$rating_class
+
+test_x  <- test_data %>% select(-id, -rating_class)
+test_y  <- test_data$rating_class
+
+#####################################################
+# 5. Train Random Forest model
+#####################################################
+
+cat("Training Random Forest model...\n")
+
+rf_model <- randomForest(
+  x         = train_x,
+  y         = train_y,
+  ntree     = 200,
+  importance = TRUE
+)
+
+rf_preds_test <- predict(rf_model, newdata = test_x)
+conf_matrix   <- confusionMatrix(rf_preds_test, test_y)
+print(conf_matrix)
+
+#####################################################
+# 6. Predict sentiment for ALL reviews
+#####################################################
+
+all_x   <- ml_df %>% select(-id, -rating_class)
+all_ids <- ml_df$id
+
+all_preds <- predict(rf_model, newdata = all_x)
+
+reviews$sentiment_rf <- NA_character_
+reviews$sentiment_rf[match(all_ids, reviews$id)] <- as.character(all_preds)
+
+#####################################################
+# 7. PLOT 1 – Sentiment distribution (RF predictions)
+#####################################################
+
+sentiment_counts <- reviews %>%
+  filter(!is.na(sentiment_rf)) %>%
+  count(sentiment_rf) %>%
+  mutate(
+    percentage = n / sum(n) * 100,
+    label = paste0(sentiment_rf, "\n", round(percentage, 1), "%")
+  )
+
+ggplot(sentiment_counts,
+       aes(x = "", y = n, fill = sentiment_rf)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = label),
+            position = position_stack(vjust = 0.5),
+            color = "white", fontface = "bold", size = 5) +
+  scale_fill_manual(values = c(
+    "positive" = "#27AE60",
+    "neutral"  = "#F39C12",
+    "negative" = "#E74C3C"
+  )) +
+  labs(
+    title    = "Sentiment Distribution – Random Forest Predictions",
+    subtitle = paste("Total Reviews:", sum(sentiment_counts$n)),
+    fill     = "Sentiment"
+  ) +
   theme_void() +
-  scale_fill_brewer(palette = "Set2")
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.position = "none"
+  )
 
-# 2. Overall word frequency
-ggplot(overall_word_freq, aes(x = reorder(word, n), y = n)) +
-  geom_col(fill = "steelblue") +
-  coord_flip() +
-  labs(title = "Top 30 Most Frequent Words in Reviews",
-       x = "Words",
-       y = "Frequency") +
-  theme_minimal()
+#####################################################
+# 8. PLOT 2 – Top 15 words by RF sentiment
+#####################################################
 
-# 3. Word frequency by sentiment
-ggplot(sentiment_word_freq, aes(x = reorder(word, n), y = n, fill = sentiment_label)) +
-  geom_col() +
-  coord_flip() +
-  facet_wrap(~sentiment_label, scales = "free") +
-  labs(title = "Top Words by Sentiment Category",
-       x = "Words",
-       y = "Frequency") +
-  theme_minimal() +
-  theme(legend.position = "none")
+data("stop_words")
 
-# 4. Word clouds for each sentiment
-# Positive reviews word cloud
-positive_words <- tokens %>%
-  filter(sentiment_label == "positive") %>%
-  count(word, sort = TRUE)
+tokens <- reviews %>%
+  select(id, text) %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!str_detect(word, "^[0-9]+$"))
 
-negative_words <- tokens %>%
-  filter(sentiment_label == "negative") %>%
-  count(word, sort = TRUE)
+tokens_pred <- tokens %>%
+  inner_join(
+    reviews %>% select(id, sentiment_rf),
+    by = "id"
+  ) %>%
+  filter(!is.na(sentiment_rf))
 
-neutral_words <- tokens %>%
-  filter(sentiment_label == "neutral") %>%
-  count(word, sort = TRUE)
-
-# Create word clouds
-par(mfrow = c(1, 3), mar = c(0, 0, 2, 0))
-
-if(nrow(positive_words) > 0) {
-  wordcloud(positive_words$word, positive_words$n, 
-            max.words = 50, 
-            colors = brewer.pal(8, "Dark2"),
-            main = "Positive Reviews")
-}
-
-if(nrow(negative_words) > 0) {
-  wordcloud(negative_words$word, negative_words$n, 
-            max.words = 50, 
-            colors = brewer.pal(8, "Dark2"),
-            main = "Negative Reviews")
-}
-
-if(nrow(neutral_words) > 0) {
-  wordcloud(neutral_words$word, neutral_words$n, 
-            max.words = 50, 
-            colors = brewer.pal(8, "Dark2"),
-            main = "Neutral Reviews")
-}
-
-# Reset plotting parameters
-par(mfrow = c(1, 1))
-
-# 5. Sentiment by product category
-category_sentiment <- reviews_with_sentiment %>%
-  group_by(category, sentiment_label) %>%
-  summarise(count = n(), .groups = "drop") %>%
-  group_by(category) %>%
-  mutate(percentage = count / sum(count) * 100)
-
-ggplot(category_sentiment, aes(x = category, y = percentage, fill = sentiment_label)) +
-  geom_col(position = "fill") +
-  coord_flip() +
-  labs(title = "Sentiment Distribution by Product Category",
-       x = "Category",
-       y = "Proportion",
-       fill = "Sentiment") +
-  scale_fill_brewer(palette = "Set2") +
-  theme_minimal()
-
-# 6. Rating vs Sentiment analysis
-rating_sentiment <- reviews_with_sentiment %>%
-  group_by(rating, sentiment_label) %>%
-  summarise(count = n(), .groups = "drop")
-
-ggplot(rating_sentiment, aes(x = factor(rating), y = count, fill = sentiment_label)) +
-  geom_col(position = "dodge") +
-  labs(title = "Rating vs Sentiment Analysis",
-       x = "Rating",
-       y = "Number of Reviews",
-       fill = "Sentiment") +
-  scale_fill_brewer(palette = "Set2") +
-  theme_minimal()
-
-# Advanced Analysis: Bigrams
-cat("\nAnalyzing common phrases (bigrams)...\n")
-
-bigrams <- reviews_with_sentiment %>%
-  unnest_tokens(bigram, clean_text, token = "ngrams", n = 2) %>%
-  separate(bigram, c("word1", "word2"), sep = " ") %>%
-  filter(!word1 %in% stop_words$word,
-         !word2 %in% stop_words$word,
-         !str_detect(word1, "^[0-9]+$"),
-         !str_detect(word2, "^[0-9]+$"),
-         nchar(word1) > 2,
-         nchar(word2) > 2) %>%
-  unite(bigram, word1, word2, sep = " ")
-
-# Top bigrams by sentiment
-bigram_freq <- bigrams %>%
-  count(sentiment_label, bigram, sort = TRUE) %>%
-  group_by(sentiment_label) %>%
-  top_n(10, n) %>%
+sentiment_words <- tokens_pred %>%
+  count(sentiment_rf, word, sort = TRUE) %>%
+  group_by(sentiment_rf) %>%
+  slice_max(n, n = 15) %>%
   ungroup()
 
-# Plot top bigrams
-ggplot(bigram_freq, aes(x = reorder(bigram, n), y = n, fill = sentiment_label)) +
-  geom_col() +
+ggplot(sentiment_words,
+       aes(x = reorder_within(word, n, sentiment_rf),
+           y = n,
+           fill = sentiment_rf)) +
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  facet_wrap(~ sentiment_rf, scales = "free_y", ncol = 1) +
   coord_flip() +
-  facet_wrap(~sentiment_label, scales = "free") +
-  labs(title = "Top Bigrams by Sentiment Category",
-       x = "Bigrams",
-       y = "Frequency") +
-  theme_minimal() +
-  theme(legend.position = "none")
+  scale_fill_manual(values = c(
+    "positive" = "#27AE60",
+    "neutral"  = "#F39C12",
+    "negative" = "#E74C3C"
+  )) +
+  labs(
+    title    = "Top 15 Words by Sentiment – Random Forest",
+    subtitle = "Most frequent words in positive, neutral, and negative reviews",
+    x        = "Words",
+    y        = "Frequency"
+  ) +
+  theme_minimal()
 
-# Export results
-cat("\nExporting results...\n")
+#####################################################
+# 9. Save results (optional)
+#####################################################
 
-# Save processed data with sentiment labels
-write.csv(reviews_with_sentiment, "reviews_with_sentiment_analysis.csv", row.names = FALSE)
+rf_results <- reviews %>%
+  select(category, `review title`, `review content`, rating, sentiment_rf)
 
-# Save word frequency tables
-write.csv(overall_word_freq, "overall_word_frequency.csv", row.names = FALSE)
-write.csv(sentiment_word_freq, "sentiment_word_frequency.csv", row.names = FALSE)
+write_csv(rf_results, "ebay_reviews_rf_sentiment.csv")
 
-# Summary statistics
-cat("\n=== SUMMARY STATISTICS ===\n")
-cat("Total reviews analyzed:", nrow(reviews_with_sentiment), "\n")
-cat("Positive reviews:", sum(reviews_with_sentiment$sentiment_label == "positive"), 
-    "(", round(mean(reviews_with_sentiment$sentiment_label == "positive") * 100, 1), "%)\n")
-cat("Neutral reviews:", sum(reviews_with_sentiment$sentiment_label == "neutral"), 
-    "(", round(mean(reviews_with_sentiment$sentiment_label == "neutral") * 100, 1), "%)\n")
-cat("Negative reviews:", sum(reviews_with_sentiment$sentiment_label == "negative"), 
-    "(", round(mean(reviews_with_sentiment$sentiment_label == "negative") * 100, 1), "%)\n")
-
-# Average sentiment by category
-cat("\nAverage Sentiment Score by Category:\n")
-category_avg_sentiment <- reviews_with_sentiment %>%
-  group_by(category) %>%
-  summarise(avg_sentiment = mean(sentiment_score),
-            n_reviews = n()) %>%
-  arrange(desc(avg_sentiment))
-
-print(category_avg_sentiment)
-
-cat("\nAnalysis complete! Check the generated visualizations and CSV files.\n")
+cat("\nRandom Forest results saved to 'ebay_reviews_rf_sentiment.csv'\n")
+cat("Test accuracy:", round(conf_matrix$overall['Accuracy'] * 100, 2), "%\n")
