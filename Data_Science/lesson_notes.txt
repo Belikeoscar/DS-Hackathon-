@@ -1,0 +1,15 @@
+Data sets is a pre requisite for supervised data learning, and these datasets have to be 
+labelled.
+
+K-NN - uses distance to predict
+
+70, 15, 15 on validation Test for DataScience CW2
+
+70 for training
+15 for testing
+15 for validation
+
+
+
+4898
+48623169
